@@ -7,7 +7,7 @@ gradio
 pypdf
 langchain-text-splitters
 tiktoken
-torch
+torch==2.5.0
 llama-index
 pytesseract==0.3.10
 pillow==10.3.0
