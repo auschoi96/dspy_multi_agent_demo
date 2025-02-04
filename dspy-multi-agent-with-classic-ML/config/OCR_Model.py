@@ -60,7 +60,7 @@ class OCRModel(mlflow.pyfunc.PythonModel):
 from mlflow.models.signature import infer_signature
 
 # Load the image and create a df with the image bytes
-test_image_path = "test_ocr.jpg"
+test_image_path = "./config/test_ocr.jpg"
 with open(test_image_path, 'rb') as f:
     image_bytes = f.read()
 

@@ -70,13 +70,24 @@ base_url = f'https://{spark.conf.get("spark.databricks.workspaceUrl")}/serving-e
 # COMMAND ----------
 
 import dspy
-llama = dspy.LM('databricks/databricks-meta-llama-3-1-70b-instruct', cache=False)
+llama = dspy.LM('databricks/databricks-meta-llama-3-3-70b-instruct', cache=False)
 mixtral = dspy.LM('databricks/databricks-mixtral-8x7b-instruct', cache=False)
 dbrx = dspy.LM('databricks/databricks-dbrx-instruct', cache=False)
 llama8b = dspy.LM('databricks/llama8b', cache=False)
 claude = dspy.LM('anthropic/claude-3-5-sonnet-20241022', api_key=ANTHROPIC_API_KEY, cache=False)
 gpt4o = dspy.LM('openai/gpt-4o', api_key=OPENAI_TOKEN)
 dspy.configure(lm=llama) #this is to set a default global model
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC The Medium article uses a Claude endpoint that is using AI Gateway. You can define the same endpoint by serving it on Model serving and using the name of the model serving endpoint instead. See the example below
+
+# COMMAND ----------
+
+import dspy
+databricks_claude = dspy.LM('databricks/austin-ai-gateway', cache=False)
+dspy.configure(lm=databricks_claude)
 
 # COMMAND ----------
 
@@ -92,15 +103,15 @@ dspy.configure(lm=llama) #this is to set a default global model
 #Agent Model Configuration
 
 router_model = llama
-router_model_name = llama.model
+router_model_name = llama.model 
 sales_model = llama
 sales_model_name = llama.model
 pokemon_model = llama
 pokemon_model_name = llama.model 
 vision_model = llama
 vision_model_name = llama.model 
-databricks_model = claude
-databricks_model_name = claude.model 
+databricks_model = llama
+databricks_model_name = llama.model 
 
 # COMMAND ----------
 
@@ -949,27 +960,6 @@ with mlflow.start_run():
 
 # COMMAND ----------
 
-import time
-import mlflow
-import pandas as pd
-from IPython.display import Markdown
-from mlflow.models import ModelSignature
-from mlflow.types.schema import ColSpec, Schema
-from mlflow.types.llm import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage
-from mlflow.models import infer_signature
-
-signature = infer_signature({"question": ["what is sinistcha?"]}, "Sinistcha is a unique Grass/Ghost type Pokemon. It's a relatively small Pokemon, standing at 2 units tall and weighing 22 units. It has two possible abilities: Hospitality and Heatproof. Sinistcha is particularly notable for its high Special Attack (121) and Defense (106) stats, making it quite formidable in battles. Its other stats include 71 HP, 60 Attack, 80 Special Defense, and 70 Speed.")
-
-with mlflow.start_run():
-  model_info = mlflow.dspy.log_model(
-    dspy_model = multi_agent_module(),
-    artifact_path='agent',
-    signature=signature,
-    registered_model_name='austin_choi_demo_catalog.agents.dspy_multi_turn_chatbot'
-  )
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC #Deploy your DSPy Agent on Databricks using the Mosaic AI Agent Framework 
 # MAGIC
@@ -985,34 +975,7 @@ with mlflow.start_run():
 
 # COMMAND ----------
 
-
-from databricks.agents import deploy
-from mlflow.utils import databricks_utils as du
-from mlflow.types.llm import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage
-
-deployment = deploy(model_name="austin_choi_demo_catalog.agents.dspy_multi_turn_chatbot", model_version=model_info.registered_model_version)
-
-# query_endpoint is the URL that can be used to make queries to the app
-deployment.query_endpoint
-
-# Copy deployment.rag_app_url to browser and start interacting with your RAG application.
-deployment.rag_app_url
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC #What's Next? 
-# MAGIC
-# MAGIC There is a whole side of evaluation and optimizations here that Databricks and DSPy provides. We can improve the performance of this module by using DSPy's optimization capabilities and it is essentially like training a ML model! 
-# MAGIC
-# MAGIC We will likely use the following: 
-# MAGIC 1. DSPy Optimizers 
-# MAGIC 2. Databricks Synthetic Data generation 
-# MAGIC 3. Databricks Mosaic AI Agent Framework for Evaluations
-
-# COMMAND ----------
-
+# DBTITLE 1,Refactor the Code to remove the Loop
 import dspy 
 import requests
 import os
@@ -1238,41 +1201,107 @@ class multi_agent_module(dspy.Module):
     print(f"Processing time: {end_time-start_time} seconds")
     return next_agent, messages
 
-  def forward(self, request: ChatCompletionRequest):
-    """Main interaction loop compatible with agent.deploy"""
-    messages = request.messages
-    next_agent = ""
-    
-    for message in messages:
-        if message["role"] == "user":
-            question = message["content"]
-            next_agent, messages = self.handle_question(question, messages, next_agent=next_agent)
-    
-    # Get the last response from the appropriate agent
-    last_response = messages[-1]["content"] if messages else ""
-    
-    return {"response": last_response}
+  def forward(self, messages, next_agent, question):
+    """Main interaction loop"""
+    messages = []
+    next_agent = next_agent
+    # question = input("User: ")
+    messages.append({"role": "user", "content": question})
+    next_agent, messages = self.handle_question(question, messages, next_agent=next_agent)
+    # print(f"Awaiting next user input: ")
+    return next_agent, messages
 
 # COMMAND ----------
 
-import time
+# MAGIC %md
+# MAGIC ###MLflow Chat Model 
+# MAGIC
+# MAGIC agent.deploy requires you to use MLflow chatmodel to comply with the chat completions requests set by agent.Deploy. It uses MLflow LLM Types to maintain the LLM structure and handle your inputs and outputs and streaming.
+# MAGIC
+# MAGIC We create a class using MLflow Chat Model to return a ChatCompletionResponse. 
+
+# COMMAND ----------
+
+from dataclasses import dataclass
+from typing import Optional, Dict, List, Generator
+from mlflow.pyfunc import ChatModel
+from mlflow.types.llm import (
+    # Non-streaming helper classes
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionChunk,
+    ChatMessage,
+    ChatChoice,
+    ChatParams,
+    # Helper classes for streaming agent output
+    ChatChoiceDelta,
+    ChatChunkChoice,
+)
+
+multi_agent = multi_agent_module()
+
+class DSPyAgent(ChatModel):
+    def __init__(self):
+        self.multi_agent = multi_agent_module()
+    
+    def _prepare_messages(self, messages: List[ChatMessage]):
+        return {"messages": [m.to_dict() for m in messages]}
+      
+    def predict(self, context, messages: list[ChatMessage], params=None) -> ChatCompletionResponse:
+        question = messages[-1].content
+        print(question)
+        print(messages)
+        next_agent, response = self.multi_agent(messages=messages, next_agent="", question=question)
+        response_message = ChatMessage(
+            role="assistant",
+            content=(
+                f"{response}"
+            )
+        )
+        return ChatCompletionResponse(
+            choices=[ChatChoice(message=response_message)]
+        )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Test your Agent!
+
+# COMMAND ----------
+
+agent = DSPyAgent()
+model_input = ChatCompletionRequest(
+    messages=[ChatMessage(role="user", content="What is Databricks?")]
+)
+response = agent.predict(context=None, messages=model_input.messages)
+print(response)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Log Model to Unity Catalog using Pyfunc
+
+# COMMAND ----------
+
 import mlflow
-import pandas as pd
-from IPython.display import Markdown
-from mlflow.models import ModelSignature
-from mlflow.types.schema import ColSpec, Schema
-from mlflow.types.llm import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage
-from mlflow.models import infer_signature
-
-signature = infer_signature({"question": ["what is sinistcha?"]}, "Sinistcha is a unique Grass/Ghost type Pokemon. It's a relatively small Pokemon, standing at 2 units tall and weighing 22 units. It has two possible abilities: Hospitality and Heatproof. Sinistcha is particularly notable for its high Special Attack (121) and Defense (106) stats, making it quite formidable in battles. Its other stats include 71 HP, 60 Attack, 80 Special Defense, and 70 Speed.")
-
 with mlflow.start_run():
-  model_info = mlflow.dspy.log_model(
-    dspy_model = multi_agent_module(),
-    artifact_path='agent',
-    signature=signature,
-    registered_model_name='austin_choi_demo_catalog.agents.dspy_multi_turn_chatbot'
+  model_info = mlflow.pyfunc.log_model(
+    python_model = DSPyAgent(),
+    artifact_path = 'model',
+    input_example={
+            "messages": [{"role": "user", "content": "What is Sinistcha?"}]
+        },
+    registered_model_name='austin_choi_demo_catalog.agents.dspy_multi_turn_chatbot_agent_deploy'
   )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ###Deploy! 
+# MAGIC
+# MAGIC The Deploy function looks for: 
+# MAGIC 1. The registered model name which is catalog.schema.model_name 
+# MAGIC 2. The version number you would like to use. You will likely have multiple versions of the model based on your testing 
 
 # COMMAND ----------
 
@@ -1281,10 +1310,32 @@ from databricks.agents import deploy
 from mlflow.utils import databricks_utils as du
 from mlflow.types.llm import ChatCompletionRequest, ChatCompletionResponse, ChatChoice, ChatMessage
 
-deployment = deploy(model_name="austin_choi_demo_catalog.agents.dspy_multi_turn_chatbot", model_version=model_info.registered_model_version)
+deployment = deploy(model_name='austin_choi_demo_catalog.agents.dspy_multi_turn_chatbot_agent_deploy', model_version=model_info.registered_model_version)
 
 # query_endpoint is the URL that can be used to make queries to the app
 deployment.query_endpoint
 
-# Copy deployment.rag_app_url to browser and start interacting with your RAG application.
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC
+# MAGIC Copy deployment.rag_app_url to browser and start interacting with your RAG application. 
+# MAGIC
+# MAGIC Or click the URLs in the cell above's output
+
+# COMMAND ----------
+
+# DBTITLE 1,This will not work until app is deployed (view status)
 deployment.rag_app_url
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #What's Next? 
+# MAGIC
+# MAGIC There is a whole side of evaluation and optimizations here that Databricks and DSPy provides. We can improve the performance of this module by using DSPy's optimization capabilities and it is essentially like training a ML model! 
+# MAGIC
+# MAGIC We will likely use the following: 
+# MAGIC 1. DSPy Optimizers 
+# MAGIC 2. Databricks Synthetic Data generation 
+# MAGIC 3. Databricks Mosaic AI Agent Framework for Evaluations
